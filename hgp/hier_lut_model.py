@@ -1,204 +1,132 @@
-from torch_geometric.loader import DataLoader
-from dataset_utils import *
 import torch
 import torch.nn.functional as F
 from torch_geometric.nn.conv import SAGEConv, GCNConv, GATConv
 from torch_geometric.nn.dense import Linear
 from torch_geometric.nn.models import JumpingKnowledge
 from torch_geometric.nn.pool import global_add_pool, global_max_pool, SAGPooling
+from torch_geometric.loader import DataLoader
+from dataset_utils import *
+from torch.distributions import Normal
+from torch.distributions import constraints
 
+import pyro
+import param
+from pyro.distributions import Normal
+from pyro.nn import PyroModule, PyroSample
+from pyro.infer import SVI, Trace_ELBO
+from pyro.optim import Adam
+from pyro.infer import Predictive
+from pyro.infer.autoguide import AutoNormal
 
 target = ['lut', 'ff', 'dsp', 'bram', 'uram', 'srl', 'cp', 'power']
 tar_idx = 0
 jknFlag = 0
 
+class BayesianNet(PyroModule):
+    def __init__(self, in_features, hidden_features, out_features):
+        super().__init__()
+        self.fc1 = PyroModule[torch.nn.Linear](in_features, hidden_features)
+        self.fc1.weight = PyroSample(prior=Normal(0., 1.).expand_by([hidden_features, in_features]).to_event(2))
+        self.fc1.bias = PyroSample(prior=Normal(0., 1.).expand_by([hidden_features]).to_event(1))
+        
+        self.fc2 = PyroModule[torch.nn.Linear](hidden_features, out_features)
+        self.fc2.weight = PyroSample(prior=Normal(0., 1.).expand_by([out_features, hidden_features]).to_event(2))
+        self.fc2.bias = PyroSample(prior=Normal(0., 1.).expand_by([out_features]).to_event(1))
+    
+    def forward(self, x, y=None):
+        x = x.float()   #Make sure the input x is of the same data type as the model parameters
+        x = F.relu(self.fc1(x))
+        mean = self.fc2(x)
+        sigma = torch.ones_like(mean)  # Make sure sigma has the same shape as mean
+    
+        '''
+        if y is not None:
+            if y.shape[0] != mean.shape[0]:
+                raise ValueError("The batch size of 'y' does not match 'mean'.")
+            if y.ndim == 1:
+                y = y.unsqueeze(1)  '''
+        
 
-class HierNet(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, num_layers, conv_type, hls_dim, drop_out=0.0, pool_ratio=0.5):
-        super(HierNet, self).__init__()
+        with pyro.plate("data", size=x.shape[0]):  # Use the correct batch size
+            obs = pyro.sample("obs", Normal(mean, sigma), obs=y)
+        return mean
 
-        self.drop_out = drop_out
-        self.pool_ratio = pool_ratio
-        if conv_type == 'gcn':
-            conv = GCNConv
-        elif conv_type == 'gat':
-            conv = GATConv
-        elif conv_type == 'sage':
-            conv = SAGEConv
-        else:
-            conv = GCNConv
-
-        self.convs = torch.nn.ModuleList()
-        self.pools = torch.nn.ModuleList()
-
-        for i in range(num_layers):
-            if i == 0:
-                self.convs.append(conv(in_channels, hidden_channels))
-            else:
-                self.convs.append(conv(hidden_channels, hidden_channels))
-            self.pools.append(SAGPooling(hidden_channels, self.pool_ratio))
-        if jknFlag:
-            self.jkn = JumpingKnowledge('lstm', channels=hidden_channels, num_layers=2)
-
-        self.global_pool = global_add_pool
-        self.channels = [hidden_channels * 2 + hls_dim, 64, 64, 1]
-        self.mlps = torch.nn.ModuleList()
-
-        for i in range(len(self.channels) - 1):
-            fc = Linear(self.channels[i], self.channels[i + 1])
-            self.mlps.append(fc)
-
-    def forward(self, x, edge_index, batch, hls_attr):
-
-        x = x.to(torch.float32)
-        h_list = []
-
-        for step in range(len(self.convs)):
-            x = self.convs[step](x, edge_index)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.drop_out, training=self.training)
-            x, edge_index, _, batch, _, _ = self.pools[step](x, edge_index, None, batch, None)
-            h = torch.cat([global_max_pool(x, batch), global_add_pool(x, batch)], dim=1)
-            h_list.append(h)
-
-        if jknFlag:
-            x = self.jkn(h_list)
-        x = h_list[0] + h_list[1] + h_list[2]
-        x = torch.cat([x, hls_attr], dim=-1)
-
-        for f in range(len(self.mlps)):
-            if f < len(self.mlps) - 1:
-                x = F.relu(self.mlps[f](x))
-                x = F.dropout(x, p=self.drop_out, training=self.training)
-            else:
-                x = self.mlps[f](x)
-
-        return x
-
-
-def train(model, train_loader):
+def train_svi(model, guide, optimizer, train_loader):
+    svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
     model.train()
-    total_mse = 0
-    total_mape = 0
-    for _, data in enumerate(train_loader):
-        data = data.to(device)
-        optimizer.zero_grad()
-        hls_attr = data['hls_attr']
-        out = model(data.x, data.edge_index, data.batch, hls_attr)
-        out = out.view(-1)
-        true_y = data['y'].t()
-        mse = F.huber_loss(out, true_y[tar_idx]).float()
-        mape = mape_loss(out, true_y[tar_idx]).float()
-        loss = mse
-        loss.backward()
-        optimizer.step()
-        total_mse += mse.item() * data.num_graphs
-        total_mape += mape.item() * data.num_graphs
-    ds = train_loader.dataset
-    total_mse = total_mse / len(ds)
-    total_mape = total_mape / len(ds)
+    num_epochs = 10 
+    for epoch in range(num_epochs):
+        total_loss = 0
+        for data in train_loader:
+            x, y = data.x.to(device).float(), data.y[tar_idx].to(device).float()    #Ensure data types are consistent before using them
+            #print("x shape:", x.shape, "y shape:", y.shape)
+            
+            #if x.shape[0] != y.shape[0]:
+                #print("Mismatch in batch sizes", x.shape, y.shape)
+                #continue  # Skip this batch or do other processing
 
-    return total_mse, total_mape
+            loss = svi.step(x, y)
+            total_loss += loss
+        print(f'Epoch {epoch} : loss = {total_loss / len(train_loader.dataset)}')
 
+'''def train_svi(model, guide, optimizer, train_loader):
+    svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
+    model.train()
+    num_epochs = 10
+    for epoch in range(num_epochs):
+        total_loss = 0
+        for data in train_loader:
+            x, y = data.x.to(device).float(), data.y.to(device).float()  
+            if x.shape[0] != y.shape[0]:
+                print(f"Mismatch in batch sizes: {x.shape} vs {y.shape}")
+                continue  
+        
+            y = y[:, tar_idx] if y.ndim > 1 else y  
 
-def test(model, loader, epoch):
+            loss = svi.step(x, y)
+            total_loss += loss
+        average_loss = total_loss / len(train_loader.dataset)
+        print(f'Epoch {epoch}: loss = {average_loss}')'''
+
+def test_svi(model, guide, test_loader):
+    svi = SVI(model, guide, Adam({"lr": 0.001}), loss=Trace_ELBO())
     model.eval()
-    with torch.no_grad():
-        mse = 0
-        mape = 0
-        y = []
-        y_hat = []
-        residual = []
-        for _, data in enumerate(loader):
-            data = data.to(device)
-            hls_attr = data['hls_attr']
-            out = model(data.x, data.edge_index, data.batch, hls_attr)
-            out = out.view(-1)
-            true_y = data['y'].t()
-            mse += F.huber_loss(out, true_y[tar_idx]).float().item() * data.num_graphs  # MSE
-            mape += mape_loss(out, true_y[tar_idx]).float().item() * data.num_graphs  # MAPE
-            y.extend(true_y[tar_idx].cpu().numpy().tolist())
-            y_hat.extend(out.cpu().detach().numpy().tolist())
-            residual.extend((true_y[tar_idx] - out).cpu().detach().numpy().tolist())
-        if epoch % 10 == 0:
-            print('pred.y:', out)
-            print('data.y:', true_y[tar_idx])
-        ds = loader.dataset
-        mse = mse / len(ds)
-        mape = mape / len(ds)
-    return mse, mape
-
+    predictive = Predictive(model, guide=guide, num_samples=100, return_sites=("obs", "_RETURN"))
+    means = []
+    for data in test_loader:
+        x = data.x.to(device)
+        samples = predictive(x)
+        means.append(samples["_RETURN"].mean(dim=0))
+    return torch.cat(means, dim=0)
 
 if __name__ == "__main__":
-    batch_size = 32
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     dataset_dir = os.path.abspath('../dataset/std')
     model_dir = os.path.abspath('./model')
+
     dataset = os.listdir(dataset_dir)
     dataset_list = generate_dataset(dataset_dir, dataset, print_info=False)
     train_ds, test_ds = split_dataset(dataset_list, shuffle=True, seed=128)
+
     print('train_ds size = {}, test_ds size = {}'.format(len(train_ds), len(test_ds)))
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=True, drop_last=True)
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, drop_last=True)
+    test_loader = DataLoader(test_ds, batch_size=32, shuffle=True, drop_last=True)
 
-    data_ini = None
-    for step, data in enumerate(train_loader):
-        if step == 0:
-            data_ini = data
-            break
+    data_ini = next(iter(train_loader))
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = HierNet(in_channels=data_ini.num_features, hidden_channels=64, num_layers=3, conv_type='sage',
-                    hls_dim=6, drop_out=0.0)
-    model = model.to(device)
-    print(model)
+    if data_ini.x is None or data_ini.x.size(1) is None:
+        raise ValueError("data_ini.x is not correctly formatted.")
 
-    LR = 0.005
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=0.001)
-    # scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9, last_epoch=-1)
+    in_features = data_ini.x.size(1) 
+    out_features = 1  
+    hidden_features = 50
 
-    min_train_mape = 1
-    min_test_mape = 1
-    for epoch in range(500):
-        train_loss, train_mape = train(model, train_loader)
-        test_loss, test_mape = test(model, test_loader, epoch)
-        print(f'Epoch: {epoch:03d}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}')
-        print(f'Epoch: {epoch:03d}, Train MAPE: {train_mape:.4f}, Test MAPE: {test_mape:.4f}')
+    model = BayesianNet(in_features, out_features, hidden_features).to(device)
+    guide = AutoNormal(model)
+    optimizer = Adam({"lr": 0.01})
 
-        if epoch % 10 == 0:
-            # scheduler.step()
-            for p in optimizer.param_groups:
-                p['lr'] *= 0.9
-
-        save_train = False
-        if train_mape < min_train_mape:
-            min_train_mape = train_mape
-            save_train = True
-
-        save_test = False
-        if test_mape < min_test_mape:
-            min_test_mape = test_mape
-            save_test = True
-
-        checkpoint_1 = {
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'epoch': epoch,
-            'min_train_mape': min_train_mape
-        }
-
-        checkpoint_2 = {
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'epoch': epoch,
-            'min_test_mape': min_test_mape
-        }
-
-        if save_train:
-            torch.save(checkpoint_1, os.path.join(model_dir, target[tar_idx] + '_h64_d0_checkpoint_train.pt'))
-
-        if save_test:
-            torch.save(checkpoint_2, os.path.join(model_dir, target[tar_idx] + '_h64_d0_checkpoint_test.pt'))
-
-    print('Min Train MAPE: ' + str(min_train_mape))
-    print('Min Test MAPE: ' + str(min_test_mape))
+    for epoch in range(10):
+        train_loss = train_svi(model, guide, optimizer, train_loader)
+        predicted_means = test_svi(model, guide, test_loader)
+        print(f'Epoch: {epoch}, Predictions: {predicted_means.mean()}')
