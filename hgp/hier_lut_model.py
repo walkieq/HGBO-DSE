@@ -1,132 +1,112 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn.conv import SAGEConv, GCNConv, GATConv
-from torch_geometric.nn.dense import Linear
-from torch_geometric.nn.models import JumpingKnowledge
-from torch_geometric.nn.pool import global_add_pool, global_max_pool, SAGPooling
+from torch_geometric.nn import SAGEConv
 from torch_geometric.loader import DataLoader
-from dataset_utils import *
-from torch.distributions import Normal
-from torch.distributions import constraints
+from torch_geometric.data import Data
 
 import pyro
-import param
-from pyro.distributions import Normal
-from pyro.nn import PyroModule, PyroSample
+from pyro.distributions import Normal, Categorical
 from pyro.infer import SVI, Trace_ELBO
 from pyro.optim import Adam
-from pyro.infer import Predictive
-from pyro.infer.autoguide import AutoNormal
 
-target = ['lut', 'ff', 'dsp', 'bram', 'uram', 'srl', 'cp', 'power']
-tar_idx = 0
-jknFlag = 0
+# Initialize input channel dimensions
+in_channels = 10  
+hidden_channels = 32  
+num_classes = 3
 
-class BayesianNet(PyroModule):
-    def __init__(self, in_features, hidden_features, out_features):
-        super().__init__()
-        self.fc1 = PyroModule[torch.nn.Linear](in_features, hidden_features)
-        self.fc1.weight = PyroSample(prior=Normal(0., 1.).expand_by([hidden_features, in_features]).to_event(2))
-        self.fc1.bias = PyroSample(prior=Normal(0., 1.).expand_by([hidden_features]).to_event(1))
+# Sample features for four nodes
+x = torch.randn((4, 10), dtype=torch.float)
+
+# Edge index for constructing graph connectivity
+edge_index = torch.tensor([[0, 1, 2, 3, 0, 2], [1, 0, 3, 2, 2, 0]], dtype=torch.long)
+
+# Labels for training
+y = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+
+# Construct a graph data object
+data = Data(x=x, edge_index=edge_index, y=y)
+
+class BayesianGNN(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super(BayesianGNN, self).__init__()
+        # Graph convolutional layer
+        self.conv1 = SAGEConv(in_channels, hidden_channels)
+        # Fully connected layers
+        self.fc1 = nn.Linear(hidden_channels, hidden_channels)
+        self.out = nn.Linear(hidden_channels, out_channels)
         
-        self.fc2 = PyroModule[torch.nn.Linear](hidden_features, out_features)
-        self.fc2.weight = PyroSample(prior=Normal(0., 1.).expand_by([out_features, hidden_features]).to_event(2))
-        self.fc2.bias = PyroSample(prior=Normal(0., 1.).expand_by([out_features]).to_event(1))
+        # Define priors for Bayesian learning
+        self.fc1w_prior = Normal(0., 1.).expand([hidden_channels, hidden_channels]).to_event(2)
+        self.fc1b_prior = Normal(0., 1.).expand([hidden_channels]).to_event(1)
+        self.outw_prior = Normal(0., 1.).expand([out_channels, hidden_channels]).to_event(2)
+        self.outb_prior = Normal(0., 1.).expand([out_channels]).to_event(1)
     
-    def forward(self, x, y=None):
-        x = x.float()   #Make sure the input x is of the same data type as the model parameters
-        x = F.relu(self.fc1(x))
-        mean = self.fc2(x)
-        sigma = torch.ones_like(mean)  # Make sure sigma has the same shape as mean
-    
-        '''
-        if y is not None:
-            if y.shape[0] != mean.shape[0]:
-                raise ValueError("The batch size of 'y' does not match 'mean'.")
-            if y.ndim == 1:
-                y = y.unsqueeze(1)  '''
-        
+    def forward(self, x, edge_index):
+        # Forward pass through layers
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.out(x)
+        return F.log_softmax(x, dim=1)
 
-        with pyro.plate("data", size=x.shape[0]):  # Use the correct batch size
-            obs = pyro.sample("obs", Normal(mean, sigma), obs=y)
-        return mean
+def model(x_data, edge_index, y_data):
+    #print("x_data shape:", x_data.shape)
+    # Bayesian inference model
+    with pyro.plate("data", size=x_data.size(0)):
+        lifted_module = pyro.random_module(
+            'module', 
+            net, 
+            {
+                'fc1.weight': net.fc1w_prior, 
+                'fc1.bias': net.fc1b_prior,
+                'out.weight': net.outw_prior, 
+                'out.bias': net.outb_prior
+            }
+        )
+        lifted_reg_model = lifted_module()
+        lhat = lifted_reg_model(x_data, edge_index)
+        pyro.sample("obs", Categorical(logits=lhat), obs=y_data)
 
-def train_svi(model, guide, optimizer, train_loader):
-    svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
-    model.train()
-    num_epochs = 10 
-    for epoch in range(num_epochs):
-        total_loss = 0
-        for data in train_loader:
-            x, y = data.x.to(device).float(), data.y[tar_idx].to(device).float()    #Ensure data types are consistent before using them
-            #print("x shape:", x.shape, "y shape:", y.shape)
-            
-            #if x.shape[0] != y.shape[0]:
-                #print("Mismatch in batch sizes", x.shape, y.shape)
-                #continue  # Skip this batch or do other processing
+def guide(x_data, edge_index, y_data):
+    #print("x_data shape in guide:", x_data.shape)  # 调试形状
+    with pyro.plate("data", x_data.size(0)):
+        fc1w_mu = torch.randn_like(net.fc1.weight)
+        fc1w_sigma = torch.randn_like(net.fc1.weight)
+        fc1b_mu = torch.randn_like(net.fc1.bias)
+        fc1b_sigma = torch.randn_like(net.fc1.bias)
+        outw_mu = torch.randn_like(net.out.weight)
+        outw_sigma = torch.randn_like(net.out.weight)
+        outb_mu = torch.randn_like(net.out.bias)
+        outb_sigma = torch.randn_like(net.out.bias)
+        # Register learnable params in the param store
+        fc1w_mu_param = pyro.param("fc1w_mu", fc1w_mu)
+        fc1w_sigma_param = pyro.param("fc1w_sigma", torch.nn.Softplus()(fc1w_sigma))
+        fc1b_mu_param = pyro.param("fc1b_mu", fc1b_mu)
+        fc1b_sigma_param = pyro.param("fc1b_sigma", torch.nn.Softplus()(fc1b_sigma))
+        outw_mu_param = pyro.param("outw_mu", outw_mu)
+        outw_sigma_param = pyro.param("outw_sigma", torch.nn.Softplus()(outw_sigma))
+        outb_mu_param = pyro.param("outb_mu", outb_mu)
+        outb_sigma_param = pyro.param("outb_sigma", torch.nn.Softplus()(outb_sigma))
+        # Use Normal distribution as variational distribution
+        fc1w_prior = Normal(loc=fc1w_mu_param, scale=fc1w_sigma_param)
+        fc1b_prior = Normal(loc=fc1b_mu_param, scale=fc1b_sigma_param)
+        outw_prior = Normal(loc=outw_mu_param, scale=outw_sigma_param)
+        outb_prior = Normal(loc=outb_mu_param, scale=outb_sigma_param)
+        priors = {'fc1.weight': fc1w_prior, 'fc1.bias': fc1b_prior,
+                  'out.weight': outw_prior, 'out.bias': outb_prior}
+        lifted_module = pyro.random_module("module", net, priors)
+        return lifted_module()
 
-            loss = svi.step(x, y)
-            total_loss += loss
-        print(f'Epoch {epoch} : loss = {total_loss / len(train_loader.dataset)}')
+# Initialize the neural network and the optimization model
+net = BayesianGNN(in_channels, hidden_channels, num_classes)
+optim = Adam({"lr": 0.01})
+svi = SVI(model, guide, optim, loss=Trace_ELBO())
 
-'''def train_svi(model, guide, optimizer, train_loader):
-    svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
-    model.train()
-    num_epochs = 10
-    for epoch in range(num_epochs):
-        total_loss = 0
-        for data in train_loader:
-            x, y = data.x.to(device).float(), data.y.to(device).float()  
-            if x.shape[0] != y.shape[0]:
-                print(f"Mismatch in batch sizes: {x.shape} vs {y.shape}")
-                continue  
-        
-            y = y[:, tar_idx] if y.ndim > 1 else y  
+num_epochs = 100
 
-            loss = svi.step(x, y)
-            total_loss += loss
-        average_loss = total_loss / len(train_loader.dataset)
-        print(f'Epoch {epoch}: loss = {average_loss}')'''
-
-def test_svi(model, guide, test_loader):
-    svi = SVI(model, guide, Adam({"lr": 0.001}), loss=Trace_ELBO())
-    model.eval()
-    predictive = Predictive(model, guide=guide, num_samples=100, return_sites=("obs", "_RETURN"))
-    means = []
-    for data in test_loader:
-        x = data.x.to(device)
-        samples = predictive(x)
-        means.append(samples["_RETURN"].mean(dim=0))
-    return torch.cat(means, dim=0)
-
-if __name__ == "__main__":
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dataset_dir = os.path.abspath('../dataset/std')
-    model_dir = os.path.abspath('./model')
-
-    dataset = os.listdir(dataset_dir)
-    dataset_list = generate_dataset(dataset_dir, dataset, print_info=False)
-    train_ds, test_ds = split_dataset(dataset_list, shuffle=True, seed=128)
-
-    print('train_ds size = {}, test_ds size = {}'.format(len(train_ds), len(test_ds)))
-
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, drop_last=True)
-    test_loader = DataLoader(test_ds, batch_size=32, shuffle=True, drop_last=True)
-
-    data_ini = next(iter(train_loader))
-
-    if data_ini.x is None or data_ini.x.size(1) is None:
-        raise ValueError("data_ini.x is not correctly formatted.")
-
-    in_features = data_ini.x.size(1) 
-    out_features = 1  
-    hidden_features = 50
-
-    model = BayesianNet(in_features, out_features, hidden_features).to(device)
-    guide = AutoNormal(model)
-    optimizer = Adam({"lr": 0.01})
-
-    for epoch in range(10):
-        train_loss = train_svi(model, guide, optimizer, train_loader)
-        predicted_means = test_svi(model, guide, test_loader)
-        print(f'Epoch: {epoch}, Predictions: {predicted_means.mean()}')
+# Training loop
+for epoch in range(num_epochs):
+    loss = svi.step(data.x, data.edge_index, data.y)
+    print(f'Epoch {epoch}: Loss {loss}')
